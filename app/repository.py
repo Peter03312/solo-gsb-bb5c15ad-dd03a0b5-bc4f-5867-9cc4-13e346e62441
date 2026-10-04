@@ -1223,3 +1223,105 @@ def get_delivery_archive(conn, archive_no: str) -> dict:
     if row is None:
         raise ApiError(404, "archive_not_found", f"归档包不存在: {archive_no}")
     return row["response"]
+
+
+# ---------------------------------------------------------------------------
+# 撤销批次的已交付凭据影响面（按归档包 + 包内目标证书逐行列出）
+# ---------------------------------------------------------------------------
+
+def get_revocation_archive_impact(conn, batch_id: int, limit: int, offset: int) -> dict:
+    """按撤销批次追查已交付归档凭据的影响面（只读，覆盖全部已存在归档包）。
+
+    清单行 = 一个归档包内的一张受影响目标证书：该目标在归档时刻冻结的追溯链
+    （快照中的 chain.nodes）包含本批被撤销证书集合中的任一证书——集合含被主动
+    撤销的证书（revocations.cert_no）与全部级联失效的下游证书（invalidations）。
+
+    - 同一目标在同一包内只列一次（其链上可能命中多个本批证书，去重为一行）；
+      同一目标出现在多个归档包时分别列出；同包未受影响项不出现；
+    - 序位均从 1 开始：delivery_position 为原交付序位（提交列表顺序），
+      revoked_chain_position 为本批被撤销证书在冻结链中的序位——失效证书必为
+      被撤销证书的下游，故链中命中任一失效证书时，被撤销证书必在同一链上，
+      该序位恒有定义；
+    - 冻结链取自归档快照（response.items），不依赖当前证书状态，因此覆盖此前
+      已存在的全部归档包，且不受事后撤销/更正影响；
+    - 归档创建与撤销并发时按两者实际提交次序判定：撤销先提交则归档按新状态
+      校验（含本批证书的包被拒、从不落库），归档先提交则其快照入清单；
+      被拒创建的包不会出现在清单中；
+    - delivery_archives / invalidations / revocations 均只增不改，按
+      (archive_no, delivery_position) 稳定排序分页，重复查询结果稳定。
+    """
+    head = conn.execute(
+        "SELECT batch_id, cert_no, revoked_at FROM revocations WHERE batch_id = %s",
+        (batch_id,),
+    ).fetchone()
+    if head is None:
+        raise ApiError(404, "revocation_not_found", f"撤销批次不存在: {batch_id}")
+
+    rows = conn.execute(
+        """
+        WITH affected AS (
+            -- 本批被撤销证书集合：被主动撤销的证书 + 级联失效的全部下游证书
+            SELECT cert_no FROM invalidations WHERE batch_id = %s
+            UNION ALL
+            SELECT cert_no FROM revocations WHERE batch_id = %s
+        ),
+        delivered AS (
+            -- 各归档包的目标证书及其冻结追溯链；ordinality 即原交付序位（从 1 开始）
+            SELECT d.archive_no,
+                   d.created_at AS archived_at,
+                   t.ordinality AS delivery_position,
+                   t.item ->> 'cert_no' AS cert_no,
+                   t.item -> 'chain' -> 'nodes' AS nodes
+            FROM delivery_archives d
+            CROSS JOIN LATERAL jsonb_array_elements(d.response -> 'items')
+                 WITH ORDINALITY AS t(item, ordinality)
+        ),
+        hits AS (
+            -- 冻结链命中本批集合的目标；被撤销证书在链中的序位（从 1 开始）
+            SELECT dl.archive_no, dl.cert_no, dl.delivery_position, dl.archived_at,
+                   MIN(n.ordinality) FILTER (
+                       WHERE n.node -> 'certificate' ->> 'cert_no' = %s
+                   ) AS revoked_chain_position
+            FROM delivered dl
+            CROSS JOIN LATERAL jsonb_array_elements(dl.nodes)
+                 WITH ORDINALITY AS n(node, ordinality)
+            WHERE n.node -> 'certificate' ->> 'cert_no' IN (SELECT cert_no FROM affected)
+            GROUP BY dl.archive_no, dl.cert_no, dl.delivery_position, dl.archived_at
+        ),
+        page AS (
+            SELECT archive_no, cert_no, delivery_position, revoked_chain_position,
+                   archived_at
+            FROM hits
+            ORDER BY archive_no ASC, delivery_position ASC
+            LIMIT %s OFFSET %s
+        )
+        -- 单语句同时给出总数与本页：空页（offset 越过末页）时 total 仍为全部命中数
+        SELECT p.archive_no, p.cert_no, p.delivery_position, p.revoked_chain_position,
+               p.archived_at, t.total
+        FROM (SELECT count(*) AS total FROM hits) t
+        LEFT JOIN page p ON true
+        """,
+        (batch_id, batch_id, head["cert_no"], limit, offset),
+    ).fetchall()
+
+    total = rows[0]["total"] if rows else 0
+    items = [
+        {
+            "archive_no": r["archive_no"],
+            "cert_no": r["cert_no"],
+            "delivery_position": r["delivery_position"],
+            "revoked_chain_position": r["revoked_chain_position"],
+            "archived_at": r["archived_at"],
+        }
+        for r in rows
+        if r["archive_no"] is not None
+    ]
+    return {
+        "batch_id": batch_id,
+        "revoked_cert_no": head["cert_no"],
+        "revoked_at": head["revoked_at"],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": items,
+    }
