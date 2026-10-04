@@ -18,6 +18,7 @@
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
 - GET    /api/v1/revocations                   撤销批次列表
 - GET    /api/v1/revocations/{batch_id}        撤销批次详情（受影响证书及引用链）
+- GET    /api/v1/revocations/{batch_id}/archive-impact  按撤销批次追查已交付凭据影响面（分页）
 """
 from typing import Literal
 
@@ -179,3 +180,19 @@ def list_revocations(
 def get_revocation(batch_id: int, pool: ConnectionPool = Depends(pool_dep)):
     with pool.connection() as conn:
         return repo.get_revocation(conn, batch_id)
+
+
+@router.get("/revocations/{batch_id}/archive-impact")
+def get_revocation_archive_impact(
+    batch_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """按撤销批次追查已交付凭据影响面：命中归档包、包内目标、两种序位与归档时刻。
+
+    仅冻结追溯链包含本批被撤销证书的目标入清单；按归档包编号及原交付序位
+    稳定分页；未知批次返回 404 revocation_not_found，无受影响归档返回空页。
+    """
+    with pool.connection() as conn:
+        return repo.get_revocation_archive_impact(conn, batch_id, limit, offset)

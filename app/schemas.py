@@ -273,5 +273,30 @@ class DeliveryArchiveResponse(BaseModel):
     )
 
 
+class ArchiveImpactItem(BaseModel):
+    """一条受影响的已交付凭据：归档包 + 包内目标 + 两种序位 + 归档时刻。"""
+    archive_no: str = Field(..., description="归档包编号")
+    cert_no: str = Field(..., description="包内目标证书编号")
+    delivery_position: int = Field(
+        ..., description="原交付序位：目标在包内提交列表中的位置，从 1 开始"
+    )
+    chain_position: int = Field(
+        ..., description="被撤销证书在该目标冻结追溯链中的序位，从 1 开始（链首基准为 1）"
+    )
+    archived_at: datetime = Field(..., description="归档时刻（归档包创建时间）")
+
+
+class ArchiveImpactResponse(BaseModel):
+    """按撤销批次追查的已交付凭据影响面（按归档包编号及原交付序位稳定分页）。"""
+    batch_id: int = Field(..., description="撤销批次号")
+    revoked_cert_no: str = Field(..., description="本批被撤销的证书编号")
+    items: list[ArchiveImpactItem] = Field(
+        ..., description="受影响的已交付凭据，按归档包编号、原交付序位升序"
+    )
+    total: int = Field(..., description="受影响条目总数（与分页无关）")
+    limit: int
+    offset: int
+
+
 class ErrorBody(BaseModel):
     error: dict

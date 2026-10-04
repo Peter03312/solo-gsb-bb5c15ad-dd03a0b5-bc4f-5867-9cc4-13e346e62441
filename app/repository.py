@@ -532,6 +532,9 @@ def issue_batch(conn, req) -> tuple[dict, bool]:
     - 批次键幂等：同键同请求 → 重放首次签发结果快照（即使证书事后被撤销）；
       同键不同请求 → 409 batch_conflict；
     - 并发同键提交由 issue_batches 主键兜底：后到事务回滚后按已提交结果重放/判冲突；
+      并发事务在“幂等检查”与“编号冲突预检”之间提交的，预检撞见已提交证书时
+      重新核对批次键并按已提交结果重放/判冲突（证书与批次行同事务落库，
+      证书可见则批次行必然可见）；
     - 与单张签发、撤销并发时，沿用同一套行锁、唯一约束与排他约束，规则一致。
     """
     req_hash, request_doc = _canonical_request(req)
@@ -540,7 +543,18 @@ def issue_batch(conn, req) -> tuple[dict, bool]:
             existing = _get_issue_batch_row(conn, req.batch_key)
             if existing is not None:
                 return _replay_or_conflict(existing, req.batch_key, req_hash), False
-            ordered = _validate_batch(conn, req)
+            try:
+                ordered = _validate_batch(conn, req)
+            except ApiError as exc:
+                if exc.code == "cert_duplicate":
+                    # 并发同键事务在幂等检查后提交：按已提交结果重放/判冲突，
+                    # 而不是把“本批次的证书”误报为与库内冲突
+                    existing = _get_issue_batch_row(conn, req.batch_key)
+                    if existing is not None:
+                        return _replay_or_conflict(
+                            existing, req.batch_key, req_hash
+                        ), False
+                raise
             _insert_batch_items(conn, ordered)
             issued_at = datetime.now(timezone.utc)
             response = _build_batch_response(conn, req, issued_at)
@@ -1223,3 +1237,68 @@ def get_delivery_archive(conn, archive_no: str) -> dict:
     if row is None:
         raise ApiError(404, "archive_not_found", f"归档包不存在: {archive_no}")
     return row["response"]
+
+
+# ---------------------------------------------------------------------------
+# 撤销影响面追查（按撤销批次列出受影响的已交付凭据）
+# ---------------------------------------------------------------------------
+
+def get_revocation_archive_impact(conn, batch_id: int, limit: int, offset: int) -> dict:
+    """按撤销批次追查已交付凭据（交付归档包）的影响面，稳定分页。
+
+    口径：归档包创建时刻快照中，某目标证书的**冻结追溯链**包含本批被撤销证书，
+    即视为受影响——每个（归档包, 目标）组合入清单一次（冻结链为简单路径，
+    被撤销证书在链上至多出现一次，故目标因本批级联失效也只列一次）；
+    同一目标出现在多个归档包时分别列出，同包未受影响的目标不出现。
+
+    序位（均从 1 开始）：
+      - delivery_position：目标证书在包内提交列表中的原交付序位；
+      - chain_position：本批被撤销证书在该目标冻结追溯链中的序位（链首基准为 1）。
+
+    稳定性：归档包与撤销批次均只增不改；被拒创建的归档包从不落库，自然不入
+    清单；且撤销提交后不可能再冻结出包含被撤销证书的新包（其下游目标必然已
+    失效、整包会被交付校验拒绝），因此影响面在撤销提交时即固定——归档创建与
+    撤销并发时以两者实际提交次序判定，重复查询结果稳定。查询直接读取既有
+    归档快照，无需任何数据迁移即可覆盖此前已存在的归档包。
+    """
+    head = conn.execute(
+        "SELECT batch_id, cert_no FROM revocations WHERE batch_id = %s",
+        (batch_id,),
+    ).fetchone()
+    if head is None:
+        raise ApiError(404, "revocation_not_found", f"撤销批次不存在: {batch_id}")
+    revoked_no = head["cert_no"]
+
+    # 展开每个归档包快照的目标列表及其冻结链节点，命中“链上含被撤销证书”的行
+    from_clause = """
+        FROM delivery_archives a
+        CROSS JOIN LATERAL jsonb_array_elements(a.response -> 'items')
+            WITH ORDINALITY AS item(item, delivery_position)
+        CROSS JOIN LATERAL jsonb_array_elements(item.item -> 'chain' -> 'nodes')
+            WITH ORDINALITY AS node(node, chain_position)
+        WHERE node.node -> 'certificate' ->> 'cert_no' = %s
+    """
+    total = conn.execute(
+        f"SELECT count(*) AS n {from_clause}", (revoked_no,)
+    ).fetchone()["n"]
+    items = conn.execute(
+        f"""
+        SELECT a.archive_no           AS archive_no,
+               item.item ->> 'cert_no' AS cert_no,
+               item.delivery_position  AS delivery_position,
+               node.chain_position     AS chain_position,
+               a.created_at            AS archived_at
+        {from_clause}
+        ORDER BY a.archive_no ASC, item.delivery_position ASC
+        LIMIT %s OFFSET %s
+        """,
+        (revoked_no, limit, offset),
+    ).fetchall()
+    return {
+        "batch_id": head["batch_id"],
+        "revoked_cert_no": revoked_no,
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
